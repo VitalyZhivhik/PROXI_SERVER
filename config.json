@@ -1,0 +1,37 @@
+{
+  "cert_port": 8000,
+  "proxy_port": 8080,
+  "upstream_proxy": "http://127.0.0.1:10809",
+  "proxy_host": "0.0.0.0",
+  "admin_user": "admin",
+  "admin_password": "123456",
+  "admins": [
+    {
+      "user": "Administrarator",
+      "password": "Administrarator",
+      "role": "admin"
+    }
+  ],
+  "open_browser": true,
+  "session_timeout": 8,
+
+  "_comment_upstream": "VPN адрес. Если VPN недоступен при старте — сервер запустится в ПРЯМОМ режиме (без VPN). Поставьте null чтобы всегда работать напрямую.",
+  "_comment_admin": "Основной администратор (superadmin). Пароль ОБЯЗАТЕЛЬНО смените!",
+  "_comment_admins": "Дополнительные администраторы. Управляются через панель /admin/users",
+  "_comment_browser": "Автооткрытие панели администратора при старте сервера",
+  "_comment_session": "Время сессии в часах",
+
+  "_comment_internet": "=== Настройки доступа в интернет (закрытая сеть) ===",
+  "internet_default_policy": "block",
+  "_comment_policy": "block = весь интернет-трафик заблокирован по умолчанию. allow = разрешён всем (как раньше)",
+  "local_network_ranges": [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.0/8",
+    "169.254.0.0/16"
+  ],
+  "_comment_local": "Диапазоны IP, считающиеся внутренней сетью. Трафик к ним всегда разрешён.",
+  "local_domains": [],
+  "_comment_local_domains": "Дополнительные домены внутренней сети (напр. ['intranet.company.ru', 'gitlab.local']). Трафик к ним всегда разрешён."
+}

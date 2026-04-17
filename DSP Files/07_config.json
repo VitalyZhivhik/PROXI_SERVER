@@ -1,0 +1,16 @@
+{
+  "database": {
+    "host": "192.168.1.100",
+    "port": 5432,
+    "name": "app_db"
+  },
+  "server": {
+    "port": 8080,
+    "workers": 4,
+    "timeout": 30
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "/var/log/app.log"
+  }
+}

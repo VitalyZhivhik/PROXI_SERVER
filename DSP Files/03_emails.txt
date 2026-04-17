@@ -1,0 +1,4 @@
+email: info@company.ru
+email: support@company.ru
+email: hr@company.ru
+email: admin@company.ru

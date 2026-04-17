@@ -1,0 +1,14 @@
+/.venv
+/.vscode
+test_uploads
+logsserver/logs
+build
+certs
+dist
+client/__pycache__
+logs
+server/__pycache__
+shared/__pycache__
+test_certs
+test_samples
+client/__pycache__
