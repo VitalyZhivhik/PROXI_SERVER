@@ -12,3 +12,4 @@ shared/__pycache__
 test_certs
 test_samples
 client/__pycache__
+__pycache__
