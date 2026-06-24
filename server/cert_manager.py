@@ -20,6 +20,16 @@ CERT_DIR = Path("certs")
 CA_KEY_FILE = CERT_DIR / "ca.key"
 CA_CERT_FILE = CERT_DIR / "ca.crt"
 CA_CERT_DER_FILE = CERT_DIR / "ca.der"  # For Windows import
+MITM_CA_PEM_FILE = CERT_DIR / "mitmproxy-ca.pem"
+MITM_CA_CERT_PEM_FILE = CERT_DIR / "mitmproxy-ca-cert.pem"
+MITM_CA_CERT_CER_FILE = CERT_DIR / "mitmproxy-ca-cert.cer"
+
+
+def _write_mitmproxy_compat_files(cert_pem: bytes, cert_der: bytes, key_pem: bytes) -> None:
+    """Expose our CA in filenames expected by mitmproxy's confdir."""
+    MITM_CA_PEM_FILE.write_bytes(cert_pem + key_pem)
+    MITM_CA_CERT_PEM_FILE.write_bytes(cert_pem)
+    MITM_CA_CERT_CER_FILE.write_bytes(cert_der)
 
 
 def generate_ca_certificate(
@@ -37,6 +47,14 @@ def generate_ca_certificate(
     CERT_DIR.mkdir(parents=True, exist_ok=True)
 
     if CA_CERT_FILE.exists() and CA_KEY_FILE.exists() and not force_regenerate:
+        cert_pem = CA_CERT_FILE.read_bytes()
+        cert_der = CA_CERT_DER_FILE.read_bytes() if CA_CERT_DER_FILE.exists() else b""
+        key_pem = CA_KEY_FILE.read_bytes()
+        if not cert_der:
+            cert = x509.load_pem_x509_certificate(cert_pem)
+            cert_der = cert.public_bytes(serialization.Encoding.DER)
+            CA_CERT_DER_FILE.write_bytes(cert_der)
+        _write_mitmproxy_compat_files(cert_pem, cert_der, key_pem)
         logger.info(f"[CertGen] Найдены существующие сертификаты в {CERT_DIR}, пропускаем генерацию")
         return CA_CERT_FILE, CA_KEY_FILE
 
@@ -89,13 +107,12 @@ def generate_ca_certificate(
 
     # ── Save private key ──────────────────────────────────────────────────────
     with open(CA_KEY_FILE, "wb") as f:
-        f.write(
-            private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
+        key_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
         )
+        f.write(key_pem)
     logger.info(f"[CertGen] Приватный ключ сохранён: {CA_KEY_FILE}")
 
     # ── Save cert in PEM format ───────────────────────────────────────────────
@@ -109,6 +126,7 @@ def generate_ca_certificate(
     with open(CA_CERT_DER_FILE, "wb") as f:
         f.write(cert_der)
     logger.info(f"[CertGen] DER сертификат сохранён: {CA_CERT_DER_FILE}")
+    _write_mitmproxy_compat_files(cert_pem, cert_der, key_pem)
 
     logger.info(
         f"[CertGen] CA сертификат успешно создан. "

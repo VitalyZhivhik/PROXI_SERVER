@@ -22,6 +22,7 @@ import sys
 import json
 import re
 import time
+import os
 import signal
 import socket
 import hashlib
@@ -50,16 +51,18 @@ from shared.internet_access import (
     submit_internet_request as ia_submit_request,
     get_internet_status as ia_get_internet_status,
 )
+from shared.object_store import get_capture_bytes
+from shared.storage_config import get_capture_local_dir
+try:
+    import shared.transparency as _tp
+    _HAS_TP = True
+except Exception:
+    _tp = None
+    _HAS_TP = False
 from server.cert_manager import (
     generate_ca_certificate, get_cert_info,
-    CA_CERT_FILE, CA_CERT_DER_FILE,
+    CA_CERT_FILE, CA_CERT_DER_FILE, CERT_DIR,
 )
-
-# Transparency: always use direct file access (no shared module import)
-# This avoids the race condition where shared.transparency reads from
-# transparency.json (chat) but incidents are in incidents.json
-_tp = None
-_HAS_TP = False
 
 # Fallback: direct JSON reader/writer if transparency.py not found
 _TP_FILE  = Path(__file__).parent.parent / "logs" / "transparency.json"   # chat only
@@ -197,6 +200,15 @@ _DEFAULT_CONFIG = {
     "proxy_port": 8080,
     "upstream_proxy": "http://127.0.0.1:10809",
     "proxy_host": "0.0.0.0",
+    "database_url": "",
+    "capture_storage": "local",
+    "capture_local_dir": "logs/captures",
+    "s3_endpoint_url": "",
+    "s3_bucket": "",
+    "s3_access_key": "",
+    "s3_secret_key": "",
+    "s3_region": "us-east-1",
+    "s3_use_ssl": False,
     # Primary admin (fallback if no "admins" list)
     "admin_user": "admin",
     "admin_password": "dlp2024",
@@ -250,7 +262,7 @@ def save_config(cfg: dict) -> bool:
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 EVENTS_FILE  = Path(__file__).parent.parent / "logs" / "dlp_events.json"
-CAPTURES_DIR = Path(__file__).parent.parent / "logs" / "captures"
+CAPTURES_DIR = get_capture_local_dir()
 CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Traffic stats ─────────────────────────────────────────────────────────────
@@ -462,6 +474,185 @@ def _check_upstream_available(upstream: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _get_wininet_proxy_server() -> str:
+    try:
+        import winreg
+        reg = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg) as key:
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+            return str(server or "") if enabled == 1 else ""
+    except Exception:
+        return ""
+
+
+def _normalize_wininet_upstream(proxy_server: str, proxy_port: int) -> str:
+    raw = (proxy_server or "").strip()
+    if not raw:
+        return ""
+
+    candidate = raw
+    if "=" in raw:
+        parts = {}
+        for chunk in raw.split(";"):
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                parts[k.strip().lower()] = v.strip()
+        candidate = (
+            parts.get("http")
+            or parts.get("https")
+            or parts.get("socks")
+            or next(iter(parts.values()), "")
+        )
+
+    candidate = candidate.strip()
+    if not candidate:
+        return ""
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
+
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(candidate)
+        if (parsed.port or 80) == proxy_port:
+            return ""
+    except Exception:
+        return ""
+    return candidate
+
+
+def _detect_fallback_upstream(proxy_port: int) -> str:
+    system_proxy = _get_wininet_proxy_server()
+    candidate = _normalize_wininet_upstream(system_proxy, proxy_port)
+    if not candidate:
+        return ""
+    if _check_upstream_available(candidate):
+        logger.info(f"[Main] ✓ Использую системный upstream: {candidate}")
+        return candidate
+    logger.warning(f"[Main] Системный upstream недоступен: {candidate}")
+    return ""
+
+
+def _resolve_upstream(upstream: str, proxy_port: int) -> str:
+    configured = (upstream or "").strip()
+    if configured.lower() in {"", "auto", "system"}:
+        detected = _detect_fallback_upstream(proxy_port)
+        if detected:
+            logger.info(f"[Main] ✓ Auto-upstream: {detected}")
+        else:
+            logger.info("[Main] Auto-upstream не найден, остаюсь в прямом режиме")
+        return detected
+
+    if _check_upstream_available(configured):
+        logger.info(f"[Main] ✓ VPN upstream доступен: {configured}")
+        return configured
+
+    fallback_upstream = _detect_fallback_upstream(proxy_port)
+    if fallback_upstream:
+        logger.warning(
+            f"[Main] ⚠ VPN upstream НЕДОСТУПЕН: {configured}\n"
+            f"  → Переключаюсь на системный upstream: {fallback_upstream}"
+        )
+        return fallback_upstream
+
+    logger.warning(
+        f"[Main] ⚠ VPN upstream НЕДОСТУПЕН: {configured}\n"
+        f"  → Запуск в ПРЯМОМ режиме (без VPN).\n"
+        f"  → Когда VPN появится — перезапустите сервер."
+    )
+    return ""
+
+
+def _get_listening_pids(port: int) -> list[int]:
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as e:
+        logger.warning(f"[PortCheck] netstat error: {e}")
+        return []
+
+    suffix = f":{port}"
+    pids = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto, local_addr, _, state, pid_text = parts[:5]
+        if proto.upper() != "TCP" or state.upper() != "LISTENING":
+            continue
+        if not local_addr.endswith(suffix):
+            continue
+        try:
+            pids.append(int(pid_text))
+        except ValueError:
+            continue
+    return sorted(set(pids))
+
+
+def _get_process_commandline(pid: int) -> str:
+    try:
+        ps = (
+            f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
+            f"if ($p) {{ $p.CommandLine }}"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return (result.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _cleanup_stale_proxy_listeners(port: int) -> None:
+    project_root = str(Path(__file__).resolve().parent.parent).lower()
+    current_pid = os.getpid()
+    for pid in _get_listening_pids(port):
+        if pid == current_pid:
+            continue
+        cmdline = _get_process_commandline(pid).lower()
+        if not cmdline:
+            continue
+        if project_root not in cmdline:
+            continue
+        if "mitmdump" not in cmdline:
+            continue
+        logger.warning(
+            f"[PortCheck] Нашёл зависший mitmdump на порту {port}, PID={pid}. Завершаю."
+        )
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F", "/T"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            time.sleep(1.0)
+        except Exception as e:
+            logger.warning(f"[PortCheck] Не удалось завершить PID={pid}: {e}")
+
+
+def _debug_connectivity_snapshot() -> None:
+    #region debug-point proxy-connectivity-snapshot
+    system_proxy = _get_wininet_proxy_server()
+    direct_dns_ok = False
+    try:
+        socket.getaddrinfo("www.bing.com", 443)
+        direct_dns_ok = True
+    except Exception as e:
+        logger.warning(f"[DebugNet] Direct DNS failed: {e}")
+    logger.info(
+        f"[DebugNet] system_proxy='{system_proxy}', direct_dns_ok={direct_dns_ok}"
+    )
+    #endregion
 
 
 def record_traffic(client_ip: str, url: str, blocked: bool):
@@ -1701,6 +1892,24 @@ class CertDistributionHandler(BaseHTTPRequestHandler):
         self._send_html(html)
 
     # ── Files viewer ──────────────────────────────────────────────────────────
+    def _resolve_capture_ref(self, requested_name: str) -> str:
+        requested_name = Path(requested_name).name
+        try:
+            events, _ = self._load_events()
+            for event in reversed(events):
+                capture_ref = event.get("capture") or ""
+                if capture_ref and Path(capture_ref).name == requested_name:
+                    return capture_ref
+        except Exception:
+            pass
+        return requested_name
+
+    def _load_capture_data(self, capture_ref: str) -> bytes | None:
+        try:
+            return get_capture_bytes(capture_ref)
+        except Exception:
+            return None
+
     def _serve_files(self, user: str):
         qs       = parse_qs(urlparse(self.path).query)
         event_id = qs.get("id", [""])[0]
@@ -1711,7 +1920,6 @@ class CertDistributionHandler(BaseHTTPRequestHandler):
 
         capture  = event.get("capture") or ""
         filename = event.get("filename") or capture
-        fpath    = CAPTURES_DIR / Path(capture).name if capture else None
         fsize    = event.get("size", 0)
         matches  = event.get("matches", [])
         details  = event.get("details", "")
@@ -1722,15 +1930,16 @@ class CertDistributionHandler(BaseHTTPRequestHandler):
 
         preview_html = ""
         download_btn = ""
-        if fpath and fpath.exists():
-            ext = orig_ext or fpath.suffix.lower()
+        capture_data = self._load_capture_data(capture) if capture else None
+        if capture and capture_data is not None:
+            ext = orig_ext or Path(capture).suffix.lower()
             download_btn = (
-                f'<a href="/capture/{fpath.name}" class="btn btn-primary" '
+                f'<a href="/capture/{Path(capture).name}" class="btn btn-primary" '
                 f'style="margin-right:8px">⬇ Скачать ({filename})</a>'
             )
             if ext in (".txt", ".json", ".xml", ".csv", ".html", ".log"):
                 try:
-                    raw = fpath.read_text(encoding="utf-8", errors="replace")
+                    raw = capture_data.decode("utf-8", errors="replace")
                     display_text = raw
                     if ext == ".json":
                         try:
@@ -1758,13 +1967,13 @@ class CertDistributionHandler(BaseHTTPRequestHandler):
                 preview_html = f"""
 <div class="card" style="margin-top:16px">
   <h3 style="color:#89b4fa;margin-bottom:12px">📄 PDF</h3>
-  <embed src="/capture/{fpath.name}" type="application/pdf"
+  <embed src="/capture/{Path(capture).name}" type="application/pdf"
          width="100%" height="600px" style="border-radius:8px;border:1px solid #30363d">
 </div>"""
             elif ext in (".doc",".docx",".xls",".xlsx"):
                 extracted = ""
                 try:
-                    raw = fpath.read_bytes()
+                    raw = capture_data
                     import zipfile, io
                     if ext in (".docx",".doc"):
                         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -2390,17 +2599,18 @@ class CertDistributionHandler(BaseHTTPRequestHandler):
             preview_html = ""
             download_btn = ""
             if can_view and inc.get("capture"):
-                cap_path = CAPTURES_DIR / Path(inc["capture"]).name
-                if cap_path.exists():
+                capture_ref = inc["capture"]
+                capture_data = self._load_capture_data(capture_ref)
+                if capture_data is not None:
                     download_btn = (
-                        f'<a href="/capture/{cap_path.name}" class="btn btn-primary">'
+                        f'<a href="/capture/{Path(capture_ref).name}" class="btn btn-primary">'
                         f'⬇ Скачать {inc.get("filename","файл")}</a>'
                     )
                     fname = inc.get("filename", "")
-                    ext = Path(fname).suffix.lower() if fname else cap_path.suffix.lower()
+                    ext = Path(fname).suffix.lower() if fname else Path(capture_ref).suffix.lower()
                     if ext in (".txt", ".csv", ".json", ".xml", ".log"):
                         try:
-                            raw = cap_path.read_text(encoding="utf-8", errors="replace")[:8000]
+                            raw = capture_data.decode("utf-8", errors="replace")[:8000]
                             import html as _html
                             preview_html = f"""
 <div class="card" style="margin-top:16px">
@@ -2413,7 +2623,7 @@ class CertDistributionHandler(BaseHTTPRequestHandler):
                     elif ext in (".docx", ".doc"):
                         try:
                             import zipfile, io, html as _html
-                            with zipfile.ZipFile(io.BytesIO(cap_path.read_bytes())) as zf:
+                            with zipfile.ZipFile(io.BytesIO(capture_data)) as zf:
                                 parts = []
                                 for n in zf.namelist():
                                     if n.endswith(".xml") and "word/document" in n:
@@ -2433,7 +2643,7 @@ class CertDistributionHandler(BaseHTTPRequestHandler):
                     elif ext in (".xlsx", ".xls"):
                         try:
                             import zipfile, io, html as _html
-                            with zipfile.ZipFile(io.BytesIO(cap_path.read_bytes())) as zf:
+                            with zipfile.ZipFile(io.BytesIO(capture_data)) as zf:
                                 parts = []
                                 if "xl/sharedStrings.xml" in zf.namelist():
                                     ss = zf.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
@@ -2712,38 +2922,7 @@ if(_chatIp) setInterval(function(){{
 
         if event_id:
             try:
-                # Update incident in incidents.json
-                items = []
-                if _INC_FILE.exists():
-                    items = json.loads(_INC_FILE.read_text(encoding="utf-8"))
-                client_ip = ""
-                filename = ""
-                for inc in items:
-                    if inc["id"] == event_id:
-                        inc["access_status"] = "requested"
-                        client_ip = inc.get("client_ip", "")
-                        filename = inc.get("filename", "")
-                        break
-                _INC_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2, default=str),
-                                     encoding="utf-8")
-                # Write notification to client_notifications.json
-                if client_ip:
-                    now = datetime.now().isoformat(timespec="seconds")
-                    notifs = {}
-                    if _NTF_FILE.exists():
-                        try: notifs = json.loads(_NTF_FILE.read_text(encoding="utf-8"))
-                        except Exception: notifs = {}
-                    notifs.setdefault(client_ip, []).append({
-                        "id": f"n_ar_{event_id}",
-                        "type": "access_request",
-                        "text": f"🔑 {message}\nФайл: «{filename}»",
-                        "time": now, "read": False,
-                        "details": {"incident_id": event_id, "filename": filename,
-                                    "admin": user, "message": message},
-                    })
-                    notifs[client_ip] = notifs[client_ip][-100:]
-                    _NTF_FILE.write_text(json.dumps(notifs, ensure_ascii=False, indent=2, default=str),
-                                         encoding="utf-8")
+                _tp.request_access(event_id, user, message=message)
                 logger.info(f"[AccessReq] {user} → {event_id}")
             except Exception as e:
                 logger.error(f"[AccessReq] Error: {e}")
@@ -2874,12 +3053,6 @@ if(_chatIp) setInterval(function(){{
         # Send notification to admin about new request
         if result.get("ok"):
             try:
-                notifs = {}
-                if _NTF_FILE.exists():
-                    try: notifs = json.loads(_NTF_FILE.read_text(encoding="utf-8"))
-                    except Exception: notifs = {}
-                # Admin notification via transparency chat
-                now = datetime.now().isoformat(timespec="seconds")
                 _tp.send_message(client_ip, "client", 
                     f"🌐 Заявка на доступ в интернет:\n{reason[:300]}",
                     sender_name=client_ip)
@@ -2906,22 +3079,13 @@ if(_chatIp) setInterval(function(){{
                             _tp.send_message(client_ip, "admin",
                                 "✅ Ваша заявка на доступ в интернет ОДОБРЕНА.",
                                 sender_name=user)
-                            # Also send notification
-                            notifs = {}
-                            if _NTF_FILE.exists():
-                                try: notifs = json.loads(_NTF_FILE.read_text(encoding="utf-8"))
-                                except Exception: notifs = {}
-                            notifs.setdefault(client_ip, []).append({
-                                "id": f"n_ia_{req_id}",
-                                "type": "internet_approved",
-                                "text": f"✅ Доступ в интернет РАЗРЕШЁН администратором {user}.",
-                                "time": datetime.now().isoformat(timespec="seconds"),
-                                "read": False,
-                                "details": {"request_id": req_id},
-                            })
-                            _NTF_FILE.write_text(
-                                json.dumps(notifs, ensure_ascii=False, indent=2),
-                                encoding="utf-8")
+                            _tp.add_notification(
+                                client_ip,
+                                "internet_approved",
+                                f"✅ Доступ в интернет РАЗРЕШЁН администратором {user}.",
+                                {"request_id": req_id},
+                                notif_id=f"n_ia_{req_id}",
+                            )
                             break
                 except Exception as e:
                     logger.warning(f"[Internet] Notify error: {e}")
@@ -2946,21 +3110,13 @@ if(_chatIp) setInterval(function(){{
                             _tp.send_message(client_ip, "admin",
                                 f"❌ Ваша заявка на доступ в интернет отклонена. {reason_text}",
                                 sender_name=user)
-                            notifs = {}
-                            if _NTF_FILE.exists():
-                                try: notifs = json.loads(_NTF_FILE.read_text(encoding="utf-8"))
-                                except Exception: notifs = {}
-                            notifs.setdefault(client_ip, []).append({
-                                "id": f"n_ia_{req_id}",
-                                "type": "internet_denied",
-                                "text": f"❌ Доступ в интернет ОТКЛОНЁН. {reason_text}",
-                                "time": datetime.now().isoformat(timespec="seconds"),
-                                "read": False,
-                                "details": {"request_id": req_id, "comment": comment},
-                            })
-                            _NTF_FILE.write_text(
-                                json.dumps(notifs, ensure_ascii=False, indent=2),
-                                encoding="utf-8")
+                            _tp.add_notification(
+                                client_ip,
+                                "internet_denied",
+                                f"❌ Доступ в интернет ОТКЛОНЁН. {reason_text}",
+                                {"request_id": req_id, "comment": comment},
+                                notif_id=f"n_ia_{req_id}",
+                            )
                             break
                 except Exception:
                     pass
@@ -3283,18 +3439,19 @@ if(_chatIp) setInterval(function(){{
 
     def _serve_capture(self, filename: str):
         filename = Path(filename).name
-        fpath    = CAPTURES_DIR / filename
-        if not fpath.exists():
+        capture_ref = self._resolve_capture_ref(filename)
+        data = self._load_capture_data(capture_ref)
+        if data is None:
             self.send_response(404); self.end_headers()
             self.wfile.write(b"Not found"); return
-        data = fpath.read_bytes()
 
         # Try to find original filename from events
         original_name = filename
         try:
             events, _ = self._load_events()
             for e in events:
-                if e.get("capture") == filename and e.get("filename"):
+                capture = e.get("capture") or ""
+                if Path(capture).name == filename and e.get("filename"):
                     original_name = e["filename"]
                     break
         except Exception:
@@ -3421,12 +3578,14 @@ class ProxyServer:
 
     def start(self) -> bool:
         logger.info(f"[ProxyServer] Запуск на {self.proxy_host}:{self.proxy_port}...")
+        _cleanup_stale_proxy_listeners(self.proxy_port)
         cmd = [
             "mitmdump",
             "-s", str(self.addon_path),
             "--listen-host", self.proxy_host,
             "--listen-port", str(self.proxy_port),
             "--set", "termlog_verbosity=info",
+            "--set", f"confdir={CERT_DIR.resolve()}",
             "--ssl-insecure",
         ]
 
@@ -3457,6 +3616,14 @@ class ProxyServer:
                 r".*\.globalsign\.com",
                 r".*\.verisign\.com",
                 r"crl\.microsoft\.com",
+                # DeepSeek: оставляем в passthrough только статику/CDN.
+                # Сам chat-домен нужно MITM-перехватывать, иначе uploads
+                # вообще не попадают в DLP и не видны в админ-панели.
+                r"www\.deepseek\.com",
+                r"cdn\.deepseek\.com",
+                r"fe-static\.deepseek\.com",
+                r"static\.deepseek\.com",
+                r".*\.deepseekstatic\.com",
             ]
             for pattern in _MINIMAL_IGNORE:
                 cmd += ["--ignore-hosts", pattern]
@@ -3587,21 +3754,10 @@ def main():
     logger.info("[Main] Шаг 0: Проверка прокси...")
     check_proxy_loop(server_ip, proxy_port, upstream)
     fix_proxy_bypass(server_ip, proxy_port)
+    _debug_connectivity_snapshot()
 
     # ── Auto-detect upstream (VPN) availability ──────────────────────────────
-    actual_upstream = ""
-    if upstream:
-        if _check_upstream_available(upstream):
-            actual_upstream = upstream
-            logger.info(f"[Main] ✓ VPN upstream доступен: {upstream}")
-        else:
-            logger.warning(
-                f"[Main] ⚠ VPN upstream НЕДОСТУПЕН: {upstream}\n"
-                f"  → Запуск в ПРЯМОМ режиме (без VPN).\n"
-                f"  → Когда VPN появится — перезапустите сервер."
-            )
-    else:
-        logger.info("[Main] Upstream не настроен — прямой режим")
+    actual_upstream = _resolve_upstream(upstream, proxy_port)
 
     logger.info("[Main] Шаг 1: Сертификаты...")
     generate_ca_certificate()

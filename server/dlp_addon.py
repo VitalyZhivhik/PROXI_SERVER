@@ -27,6 +27,9 @@ from shared.log_config import setup_logging
 from shared.internet_access import (
     is_local_host, client_has_internet_access,
 )
+from shared.object_store import store_capture
+from shared.storage_config import get_capture_local_dir
+import shared.transparency as transparency
 from mitmproxy import http
 
 logger = setup_logging("proxy", log_dir="logs")
@@ -49,121 +52,35 @@ _LOCAL_DOMAINS   = _ADDON_CFG.get("local_domains", [])
 _SERVER_IP       = ""  # set in DLPAddon.__init__
 
 EVENTS_FILE    = Path(__file__).parent.parent / "logs" / "dlp_events.json"
-CAPTURES_DIR   = Path(__file__).parent.parent / "logs" / "captures"
+CAPTURES_DIR   = get_capture_local_dir()
 ACTIVITY_DIR   = Path(__file__).parent.parent / "logs" / "activity"
-TRANSPARENCY_FILE = Path(__file__).parent.parent / "logs" / "transparency.json"
-
-# ── SEPARATE files to avoid race conditions with server process ──────────────
-INCIDENTS_FILE     = Path(__file__).parent.parent / "logs" / "incidents.json"
-NOTIFICATIONS_FILE = Path(__file__).parent.parent / "logs" / "client_notifications.json"
-
-_tp_lock = threading.Lock()
-
 def _create_incident_and_notify(event_id: str, client_ip: str, filename: str,
                                  host: str, url: str, filetype: str,
                                  filesize: int, rules: list[str],
                                  matches: list[dict], score: int,
                                  capture: str = ""):
-    """Write incident and notification to SEPARATE files.
-    Never touches transparency.json (server writes there for chat).
-    This eliminates the race condition that erased incidents."""
+    """Write incident and related notification via shared transparency storage."""
     now = datetime.now().isoformat(timespec="seconds")
-    quotes = [m.get("sample", "")[:60] for m in matches if m.get("sample")]
-    rules_desc = "; ".join(
-        f"{m.get('rule','')}: {m.get('description','')}" for m in matches[:3]
-    )
-    incident = {
-        "id": event_id, "time": now,
-        "client_ip": client_ip, "filename": filename,
-        "host": host, "url": url[:200],
-        "filetype": filetype, "filesize": filesize,
-        "rules": rules, "score": score, "capture": capture,
-        "status": "new", "access_status": "locked", "admin_notes": "",
-        "matches": [{"rule": m.get("rule",""), "description": m.get("description",""),
-                      "severity": m.get("severity",""), "sample": m.get("sample","")[:60],
-                      "score": m.get("score", 0)} for m in matches[:10]],
-    }
-    block_notif = {
-        "id": f"n_blk_{event_id}",
-        "type": "blocked",
-        "text": (f"🚫 Файл «{filename}» заблокирован системой DLP.\n"
-                 f"Причина: {rules_desc}\n"
-                 f"{'Обнаружено: ' + ', '.join(f'«{q}»' for q in quotes[:5]) if quotes else ''}"),
-        "time": now, "read": False,
-        "details": {
-            "incident_id": event_id, "filename": filename,
-            "rules": rules, "score": score,
-            "quotes": quotes[:5], "reason": rules_desc,
-        },
-    }
-    with _tp_lock:
-        try:
-            # ── Write incident to incidents.json ─────────────────────────────
-            inc_list = []
-            if INCIDENTS_FILE.exists():
-                try:
-                    inc_list = json.loads(INCIDENTS_FILE.read_text(encoding="utf-8"))
-                except Exception:
-                    inc_list = []
-            inc_list.append(incident)
-            inc_list = inc_list[-500:]
-            INCIDENTS_FILE.write_text(
-                json.dumps(inc_list, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8"
-            )
-            # ── Write notification to client_notifications.json ──────────────
-            notifs = {}
-            if NOTIFICATIONS_FILE.exists():
-                try:
-                    notifs = json.loads(NOTIFICATIONS_FILE.read_text(encoding="utf-8"))
-                except Exception:
-                    notifs = {}
-            notifs.setdefault(client_ip, []).append(block_notif)
+    try:
+        transparency.create_incident(
+            event_id, client_ip, filename, host, url, filetype,
+            filesize, rules, matches, score, capture
+        )
 
-            # Auto-access-request if enabled
-            try:
-                settings_file = Path(__file__).parent.parent / "logs" / "dlp_settings.json"
-                if settings_file.exists():
-                    settings = json.loads(settings_file.read_text(encoding="utf-8"))
-                    if settings.get("auto_access_request"):
-                        msg_text = settings.get("access_request_message",
-                            "Администратор запрашивает разрешение на просмотр.")
-                        # Update incident access status
-                        for inc in inc_list:
-                            if inc["id"] == event_id:
-                                inc["access_status"] = "requested"
-                                break
-                        INCIDENTS_FILE.write_text(
-                            json.dumps(inc_list, ensure_ascii=False, indent=2, default=str),
-                            encoding="utf-8"
-                        )
-                        # Add access request notification
-                        access_notif = {
-                            "id": f"n_ar_{event_id}",
-                            "type": "access_request",
-                            "text": f"🔑 {msg_text}\nФайл: «{filename}»\n\nПричина блокировки: {rules_desc}",
-                            "time": now, "read": False,
-                            "details": {
-                                "incident_id": event_id, "filename": filename,
-                                "admin": "system (авто)", "message": msg_text,
-                                "reason": rules_desc, "quotes": quotes[:5],
-                            },
-                        }
-                        notifs[client_ip].append(access_notif)
-                        logger.info(f"[AutoAccess] Request sent for #{event_id}")
-            except Exception:
-                pass
+        settings_file = Path(__file__).parent.parent / "logs" / "dlp_settings.json"
+        if settings_file.exists():
+            settings = json.loads(settings_file.read_text(encoding="utf-8"))
+            if settings.get("auto_access_request"):
+                msg_text = settings.get(
+                    "access_request_message",
+                    "Администратор запрашивает разрешение на просмотр."
+                )
+                transparency.request_access(event_id, "system (авто)", message=msg_text)
+                logger.info(f"[AutoAccess] Request sent for #{event_id}")
 
-            notifs[client_ip] = notifs[client_ip][-100:]
-            NOTIFICATIONS_FILE.write_text(
-                json.dumps(notifs, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8"
-            )
-            logger.info(f"[Incident] #{event_id} | {client_ip} | {filename} | score={score}")
-        except Exception as e:
-            logger.error(f"[Incident] Write error: {e}")
-        except Exception as e:
-            logger.error(f"[Incident] Write error: {e}")
+        logger.info(f"[Incident] #{event_id} | {client_ip} | {filename} | score={score}")
+    except Exception as e:
+        logger.error(f"[Incident] Write error: {e}")
 CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
 ACTIVITY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -236,6 +153,7 @@ def _record_activity(ip: str, method: str, url: str, host: str,
             _activity[ip].pop(0)
         # Save activity to per-client file
         _save_activity(ip)
+    _save_events()
 
 
 def _save_activity(ip: str):
@@ -487,23 +405,14 @@ def _extract_multipart(content: bytes, ct: str) -> tuple[bytes | None, str, str]
 
 def _save_capture(data: bytes, event_id: str, ext: str,
                   original_name: str = "") -> str | None:
-    """Save captured file. Returns capture filename (URL-safe, no Cyrillic).
-    Original filename is stored in the event JSON, not in the filesystem."""
+    """Save captured file to configured storage and return capture reference."""
     try:
-        if not data or len(data) < 10:
-            return None
-        # Use clean filename: eventid.ext (no Cyrillic — safe for HTTP URLs)
-        if ext and ext != "bin":
-            fname = f"{event_id}.{ext}"
-        elif original_name:
-            orig_ext = Path(original_name).suffix.lstrip(".")
-            fname = f"{event_id}.{orig_ext}" if orig_ext else f"{event_id}.bin"
-        else:
-            fname = f"{event_id}.bin"
-        fpath = CAPTURES_DIR / fname
-        fpath.write_bytes(data)
-        logger.info(f"[Capture] {fname} ({len(data)} байт) orig={original_name or '—'}")
-        return fname
+        capture_ref = store_capture(data, event_id, ext, original_name)
+        if capture_ref:
+            logger.info(
+                f"[Capture] {capture_ref} ({len(data)} байт) orig={original_name or '—'}"
+            )
+        return capture_ref
     except Exception as e:
         logger.debug(f"[Capture] Ошибка: {e}")
         return None

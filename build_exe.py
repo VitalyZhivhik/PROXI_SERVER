@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target",
         choices=["client", "server", "all"],
-        default="client",
+        default="all",
         help="Что собирать: клиент, сервер или оба приложения.",
     )
     parser.add_argument(
